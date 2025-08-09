@@ -1,0 +1,191 @@
+import { Router, Request, Response } from 'express';
+import { query } from '../utils/database';
+import { authenticateToken } from '../middleware/auth';
+import { CreateCategoryRequest, UpdateCategoryRequest, Category } from '../models/types';
+
+const router = Router();
+
+interface AuthenticatedRequest extends Request {
+  user?: {
+    id: number;
+    username: string;
+    name: string;
+  };
+}
+
+// Get all categories for a user (with optional type filter)
+router.get('/', authenticateToken, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const { type } = req.query;
+
+    let queryText = 'SELECT * FROM categories WHERE user_id = ?';
+    const queryParams: any[] = [userId];
+
+    if (type && (type === 'expense' || type === 'income')) {
+      queryText += ' AND type = ?';
+      queryParams.push(type);
+    }
+
+    queryText += ' ORDER BY created_at DESC';
+
+    const result = await query(queryText, queryParams);
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching categories:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Create a new category
+router.post('/', authenticateToken, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const { name, description, type }: CreateCategoryRequest = req.body;
+
+    // Validate required fields
+    if (!name || !type) {
+      return res.status(400).json({ message: 'Name and type are required' });
+    }
+
+    if (type !== 'expense' && type !== 'income') {
+      return res.status(400).json({ message: 'Type must be either "expense" or "income"' });
+    }
+
+    // Check if category name already exists for this user and type
+    const existingCategory = await query(
+      'SELECT id FROM categories WHERE user_id = ? AND name = ? AND type = ?',
+      [userId, name, type]
+    );
+
+    if (existingCategory.rows.length > 0) {
+      return res.status(400).json({ message: 'Category name already exists for this type' });
+    }
+
+    const result = await query(
+      'INSERT INTO categories (user_id, name, description, type) VALUES (?, ?, ?, ?) RETURNING *',
+      [userId, name, description || null, type]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error('Error creating category:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Update a category
+router.put('/:id', authenticateToken, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const categoryId = parseInt(req.params.id);
+    const { name, description }: UpdateCategoryRequest = req.body;
+
+    if (!categoryId || isNaN(categoryId)) {
+      return res.status(400).json({ message: 'Invalid category ID' });
+    }
+
+    // Check if category exists and belongs to user
+    const existingCategory = await query(
+      'SELECT * FROM categories WHERE id = ? AND user_id = ?',
+      [categoryId, userId]
+    );
+
+    if (existingCategory.rows.length === 0) {
+      return res.status(404).json({ message: 'Category not found' });
+    }
+
+    // If name is being updated, check for duplicates
+    if (name) {
+      const duplicateCategory = await query(
+        'SELECT id FROM categories WHERE user_id = ? AND name = ? AND type = ? AND id != ?',
+        [userId, name, existingCategory.rows[0].type, categoryId]
+      );
+
+      if (duplicateCategory.rows.length > 0) {
+        return res.status(400).json({ message: 'Category name already exists for this type' });
+      }
+    }
+
+    // Build update query dynamically
+    const updates: string[] = [];
+    const values: any[] = [];
+
+    if (name !== undefined) {
+      updates.push('name = ?');
+      values.push(name);
+    }
+
+    if (description !== undefined) {
+      updates.push('description = ?');
+      values.push(description);
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ message: 'No valid fields to update' });
+    }
+
+    values.push(categoryId, userId);
+
+    const updateQuery = `UPDATE categories SET ${updates.join(', ')} WHERE id = ? AND user_id = ?`;
+    const result = await query(updateQuery, values);
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ message: 'Category not found' });
+    }
+
+    // Fetch the updated category
+    const updatedCategory = await query(
+      'SELECT * FROM categories WHERE id = ? AND user_id = ?',
+      [categoryId, userId]
+    );
+
+    res.json(updatedCategory.rows[0]);
+  } catch (error) {
+    console.error('Error updating category:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Delete a category
+router.delete('/:id', authenticateToken, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const categoryId = parseInt(req.params.id);
+
+    if (!categoryId || isNaN(categoryId)) {
+      return res.status(400).json({ message: 'Invalid category ID' });
+    }
+
+    // Check if category exists and belongs to user
+    const existingCategory = await query(
+      'SELECT * FROM categories WHERE id = ? AND user_id = ?',
+      [categoryId, userId]
+    );
+
+    if (existingCategory.rows.length === 0) {
+      return res.status(404).json({ message: 'Category not found' });
+    }
+
+    // Check if category is being used in transactions
+    const transactionsUsingCategory = await query(
+      'SELECT COUNT(*) as count FROM transactions WHERE user_id = ? AND category = ?',
+      [userId, existingCategory.rows[0].name]
+    );
+
+    if (transactionsUsingCategory.rows[0].count > 0) {
+      return res.status(400).json({ 
+        message: 'Cannot delete category that is being used in transactions' 
+      });
+    }
+
+    await query('DELETE FROM categories WHERE id = ? AND user_id = ?', [categoryId, userId]);
+    
+    res.json({ message: 'Category deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting category:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+export default router;
